@@ -12,6 +12,30 @@ use super::virtio_input_bitmap;
 use super::virtio_input_device_ids;
 use super::VirtioInputConfig;
 
+/// Instantiates a VirtioInputConfig for an absolute mouse/tablet-style pointer.
+///
+/// This deliberately advertises ABS_X/ABS_Y plus normal mouse buttons, without
+/// touchpad or touchscreen properties. Linux userspace classifies this shape as
+/// an absolute mouse (the same model used by integrated VM pointing devices).
+pub fn new_absolute_pointer_config(
+    idx: u32,
+    width: u32,
+    height: u32,
+    name: Option<&str>,
+) -> VirtioInputConfig {
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Absolute Pointer {idx}"));
+    VirtioInputConfig::new(
+        virtio_input_device_ids::new(0, 0, 0, 0),
+        name,
+        format!("virtio-absolute-pointer-{idx}"),
+        virtio_input_bitmap::new([0u8; 128]),
+        default_absolute_pointer_events(),
+        default_trackpad_absinfo(width, height),
+    )
+}
+
 /// Instantiates a VirtioInputConfig object with the default configuration for a trackpad. It
 /// supports touch, left button and right button events, as well as X and Y axis.
 pub fn new_trackpad_config(
@@ -308,6 +332,16 @@ fn default_trackpad_events() -> BTreeMap<u16, virtio_input_bitmap> {
     supported_events
 }
 
+fn default_absolute_pointer_events() -> BTreeMap<u16, virtio_input_bitmap> {
+    let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
+    supported_events.insert(
+        EV_KEY,
+        virtio_input_bitmap::from_bits(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE]),
+    );
+    supported_events.insert(EV_ABS, virtio_input_bitmap::from_bits(&[ABS_X, ABS_Y]));
+    supported_events
+}
+
 fn default_mouse_events() -> BTreeMap<u16, virtio_input_bitmap> {
     let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
     supported_events.insert(
@@ -484,6 +518,31 @@ fn default_rotary_events() -> BTreeMap<u16, virtio_input_bitmap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_new_absolute_pointer_config() {
+        let config = new_absolute_pointer_config(7, 1600, 900, None);
+
+        assert_eq!(config.name, "Crosvm Virtio Absolute Pointer 7");
+        assert_eq!(config.serial_name, "virtio-absolute-pointer-7");
+        assert_eq!(config.properties, virtio_input_bitmap::new([0u8; 128]));
+        assert_eq!(
+            config.supported_events[&EV_KEY],
+            virtio_input_bitmap::from_bits(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE])
+        );
+        assert_eq!(
+            config.supported_events[&EV_ABS],
+            virtio_input_bitmap::from_bits(&[ABS_X, ABS_Y])
+        );
+        assert_eq!(
+            config.axis_info[&ABS_X],
+            virtio_input_absinfo::new(0, 1600, 0, 0)
+        );
+        assert_eq!(
+            config.axis_info[&ABS_Y],
+            virtio_input_absinfo::new(0, 900, 0, 0)
+        );
+    }
 
     #[test]
     fn test_new_switches_config() {

@@ -11,7 +11,6 @@ extern crate base;
 mod dwl;
 
 use std::cell::Cell;
-use std::cmp::max;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::ffi::CString;
@@ -202,7 +201,6 @@ pub struct DisplayWl {
     dmabufs: HashMap<u32, DwlDmabuf>,
     ctx: DwlContext,
     current_event: Option<dwl_event>,
-    mt_tracking_id: u16,
 }
 
 /// Error logging callback used by wrapped C implementation.
@@ -264,7 +262,6 @@ impl DisplayWl {
             dmabufs: HashMap::new(),
             ctx,
             current_event: None,
-            mt_tracking_id: 0u16,
         })
     }
 
@@ -280,16 +277,6 @@ impl DisplayWl {
             dwl_context_next_event(self.ctx(), &mut ev);
             ev
         }
-    }
-
-    fn next_tracking_id(&mut self) -> i32 {
-        let cur_id: i32 = self.mt_tracking_id as i32;
-        self.mt_tracking_id = self.mt_tracking_id.wrapping_add(1);
-        cur_id
-    }
-
-    fn current_tracking_id(&self) -> i32 {
-        self.mt_tracking_id as i32
     }
 }
 
@@ -326,38 +313,29 @@ impl DisplayT for DisplayWl {
                     device_type: EventDeviceKind::Keyboard,
                 })
             }
-            // TODO(tutankhamen): slot is always 0, because all the input
-            // events come from mouse device, i.e. only one touch is possible at a time.
-            // Full MT protocol has to be implemented and properly wired later.
-            DWL_EVENT_TYPE_TOUCH_DOWN | DWL_EVENT_TYPE_TOUCH_MOTION => {
-                let tracking_id = if event.event_type == DWL_EVENT_TYPE_TOUCH_DOWN {
-                    self.next_tracking_id()
-                } else {
-                    self.current_tracking_id()
-                };
-
+            DWL_EVENT_TYPE_POINTER_MOVE => {
                 let events = vec![
-                    virtio_input_event::multitouch_slot(0),
-                    virtio_input_event::multitouch_tracking_id(tracking_id),
-                    virtio_input_event::multitouch_absolute_x(max(0, event.params[0])),
-                    virtio_input_event::multitouch_absolute_y(max(0, event.params[1])),
-                    virtio_input_event::touch(true),
+                    virtio_input_event::absolute_x(event.params[0].max(0)),
+                    virtio_input_event::absolute_y(event.params[1].max(0)),
                 ];
                 Some(GpuDisplayEvents {
                     events,
                     device_type: EventDeviceKind::Touchscreen,
                 })
             }
-            DWL_EVENT_TYPE_TOUCH_UP => {
-                let events = vec![
-                    virtio_input_event::multitouch_slot(0),
-                    virtio_input_event::multitouch_tracking_id(-1),
-                    virtio_input_event::touch(false),
-                ];
+            DWL_EVENT_TYPE_POINTER_BUTTON => {
+                let linux_button = event.params[0] as u16;
+                let pressed = event.params[1] != 0;
+                let events = vec![virtio_input_event::key(linux_button, pressed, false)];
                 Some(GpuDisplayEvents {
                     events,
                     device_type: EventDeviceKind::Touchscreen,
                 })
+            }
+            // --display-window-mouse is backed by an absolute mouse device. Native Wayland touch
+            // events are not forwarded through that device.
+            DWL_EVENT_TYPE_TOUCH_DOWN | DWL_EVENT_TYPE_TOUCH_MOTION | DWL_EVENT_TYPE_TOUCH_UP => {
+                None
             }
             _ => {
                 error!("unknown event type {}", event.event_type);

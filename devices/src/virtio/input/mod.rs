@@ -757,6 +757,25 @@ where
     ))
 }
 
+/// Creates a virtio absolute pointer with ABS_X/ABS_Y and normal mouse buttons.
+pub fn new_absolute_pointer<T>(
+    idx: u32,
+    source: T,
+    width: u32,
+    height: u32,
+    name: Option<&str>,
+    virtio_features: u64,
+) -> Result<Input<SocketEventSource<T>>>
+where
+    T: Read + Write + AsRawDescriptor + Send + 'static,
+{
+    Ok(Input::new(
+        defaults::new_absolute_pointer_config(idx, width, height, name),
+        Some(SocketEventSource::new(source)),
+        virtio_features,
+    ))
+}
+
 /// Creates a new virtio trackpad device which supports (single) touch, primary and secondary
 /// buttons as well as X and Y axis.
 pub fn new_trackpad<T>(

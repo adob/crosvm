@@ -314,47 +314,27 @@ fn create_virtio_devices(
                 let (event_device_socket, virtio_dev_socket) =
                     StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
                         .context("failed to create socket")?;
-                let mut multi_touch_width = gpu_display_w;
-                let mut multi_touch_height = gpu_display_h;
-                let mut multi_touch_name = None;
-                for input in &cfg.virtio_input {
-                    if let InputDeviceOption::MultiTouch {
-                        width,
-                        height,
-                        name,
-                        ..
-                    } = input
-                    {
-                        if let Some(width) = width {
-                            multi_touch_width = *width;
-                        }
-                        if let Some(height) = height {
-                            multi_touch_height = *height;
-                        }
-                        if let Some(name) = name {
-                            multi_touch_name = Some(name.as_str());
-                        }
-                        break;
-                    }
-                }
-                let dev = virtio::input::new_multi_touch(
-                    // u32::MAX is the least likely to collide with the indices generated above for
-                    // the multi_touch options, which begin at 0.
+                let dev = virtio::input::new_absolute_pointer(
+                    // u32::MAX is the least likely to collide with indices generated for explicit
+                    // input devices.
                     u32::MAX,
                     virtio_dev_socket,
-                    multi_touch_width,
-                    multi_touch_height,
-                    multi_touch_name,
+                    gpu_display_w,
+                    gpu_display_h,
+                    None,
                     virtio::base_features(cfg.protection_type),
                 )
                 .context("failed to set up mouse device")?;
                 devs.push((
-                    "multi_touch",
+                    "absolute_pointer",
                     VirtioDeviceStub {
                         dev: Box::new(dev),
                         jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
                     },
                 ));
+                // EventDeviceKind::Touchscreen is retained here as the internal routing key for
+                // display-window absolute pointing events. The guest-visible device above is an
+                // absolute mouse, not a touchscreen.
                 event_devices.push(EventDevice::touchscreen(event_device_socket));
             }
             if cfg.display_window_keyboard {

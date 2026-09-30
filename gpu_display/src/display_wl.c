@@ -28,9 +28,11 @@
 #include <wayland-client-protocol.h>
 #include <wayland-client.h>
 
-// BTN_LEFT is copied from linux/input-event-codes.h because the kernel headers
-// aren't readily available in some downstream projects.
+// Mouse button codes are copied from linux/input-event-codes.h because the
+// kernel headers aren't readily available in some downstream projects.
 #define BTN_LEFT 0x110
+#define BTN_RIGHT 0x111
+#define BTN_MIDDLE 0x112
 
 #define DEFAULT_SCALE 2
 #define MAX_BUFFER_COUNT 64
@@ -91,7 +93,6 @@ struct input {
 	struct wl_surface *pointer_input_surface;
 	int32_t pointer_x;
 	int32_t pointer_y;
-	bool pointer_lbutton_state;
 };
 
 typedef void (*dwl_error_callback_type)(const char *message);
@@ -372,6 +373,13 @@ static void pointer_enter_handler(void *data, struct wl_pointer *wl_pointer,
 	input->pointer_input_surface = surface;
 	input->pointer_x = wl_fixed_to_int(x);
 	input->pointer_y = wl_fixed_to_int(y);
+
+	struct dwl_event event = {0};
+	event.surface_descriptor = input->pointer_input_surface;
+	event.event_type = DWL_EVENT_TYPE_POINTER_MOVE;
+	event.params[0] = input->pointer_x;
+	event.params[1] = input->pointer_y;
+	dwl_context_push_event(context, &event);
 }
 
 static void pointer_leave_handler(void *data, struct wl_pointer *wl_pointer,
@@ -397,13 +405,11 @@ static void pointer_motion_handler(void *data, struct wl_pointer *wl_pointer,
 
 	input->pointer_x = wl_fixed_to_int(x);
 	input->pointer_y = wl_fixed_to_int(y);
-	if (input->pointer_lbutton_state) {
-		event.surface_descriptor = input->pointer_input_surface;
-		event.event_type = DWL_EVENT_TYPE_TOUCH_MOTION;
-		event.params[0] = input->pointer_x;
-		event.params[1] = input->pointer_y;
-		dwl_context_push_event(context, &event);
-	}
+	event.surface_descriptor = input->pointer_input_surface;
+	event.event_type = DWL_EVENT_TYPE_POINTER_MOVE;
+	event.params[0] = input->pointer_x;
+	event.params[1] = input->pointer_y;
+	dwl_context_push_event(context, &event);
 }
 
 static void pointer_button_handler(void *data, struct wl_pointer *wl_pointer,
@@ -416,17 +422,23 @@ static void pointer_button_handler(void *data, struct wl_pointer *wl_pointer,
 	(void)time;
 	(void)serial;
 
-	// we track only the left mouse button since we emulate a single touch device
-	if (button == BTN_LEFT) {
-		input->pointer_lbutton_state = state != 0;
-		struct dwl_event event = {0};
-		event.surface_descriptor = input->pointer_input_surface;
-		event.event_type = (state != 0)?
-			DWL_EVENT_TYPE_TOUCH_DOWN:DWL_EVENT_TYPE_TOUCH_UP;
-		event.params[0] = input->pointer_x;
-		event.params[1] = input->pointer_y;
-		dwl_context_push_event(context, &event);
-	}
+	if (button != BTN_LEFT && button != BTN_RIGHT && button != BTN_MIDDLE)
+		return;
+
+	// Synchronize the absolute position before reporting the button event.
+	struct dwl_event motion_event = {0};
+	motion_event.surface_descriptor = input->pointer_input_surface;
+	motion_event.event_type = DWL_EVENT_TYPE_POINTER_MOVE;
+	motion_event.params[0] = input->pointer_x;
+	motion_event.params[1] = input->pointer_y;
+	dwl_context_push_event(context, &motion_event);
+
+	struct dwl_event button_event = {0};
+	button_event.surface_descriptor = input->pointer_input_surface;
+	button_event.event_type = DWL_EVENT_TYPE_POINTER_BUTTON;
+	button_event.params[0] = button;
+	button_event.params[1] = state;
+	dwl_context_push_event(context, &button_event);
 }
 
 static void wl_pointer_frame(void *data, struct wl_pointer *wl_pointer)

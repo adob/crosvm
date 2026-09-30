@@ -11,7 +11,6 @@
 )]
 mod xlib;
 
-use std::cmp::max;
 use std::ffi::c_void;
 use std::ffi::CStr;
 use std::ffi::CString;
@@ -499,7 +498,6 @@ pub struct DisplayX {
     visual: *mut xlib::Visual,
     keycode_translator: KeycodeTranslator,
     current_event: Option<XEvent>,
-    mt_tracking_id: u16,
 }
 
 impl DisplayX {
@@ -572,19 +570,8 @@ impl DisplayX {
                 visual,
                 keycode_translator,
                 current_event: None,
-                mt_tracking_id: 0,
             })
         }
-    }
-
-    pub fn next_tracking_id(&mut self) -> i32 {
-        let cur_id: i32 = self.mt_tracking_id as i32;
-        self.mt_tracking_id = self.mt_tracking_id.wrapping_add(1);
-        cur_id
-    }
-
-    pub fn current_tracking_id(&self) -> i32 {
-        self.mt_tracking_id as i32
     }
 }
 
@@ -635,50 +622,31 @@ impl DisplayT for DisplayX {
                 event: button_event,
                 pressed,
             } => {
-                // We only support a single touch from button 1 (left mouse button).
-                // TODO(tutankhamen): slot is always 0, because all the input
-                // events come from mouse device, i.e. only one touch is possible at a time.
-                // Full MT protocol has to be implemented and properly wired later.
-                if button_event.button & xlib::Button1 != 0 {
-                    // The touch event *must* be first per the Linux input subsystem's guidance.
-                    let mut events = vec![virtio_input_event::multitouch_slot(0)];
-
-                    if pressed {
-                        events.push(virtio_input_event::multitouch_tracking_id(
-                            self.next_tracking_id(),
-                        ));
-                        events.push(virtio_input_event::multitouch_absolute_x(max(
-                            0,
-                            button_event.x,
-                        )));
-                        events.push(virtio_input_event::multitouch_absolute_y(max(
-                            0,
-                            button_event.y,
-                        )));
-                    } else {
-                        events.push(virtio_input_event::multitouch_tracking_id(-1));
-                    }
-
-                    return Some(GpuDisplayEvents {
-                        events,
-                        device_type: EventDeviceKind::Touchscreen,
-                    });
-                }
+                let button = match button_event.button {
+                    1 => virtio_input_event::left_click(pressed),
+                    2 => virtio_input_event::middle_click(pressed),
+                    3 => virtio_input_event::right_click(pressed),
+                    _ => return None,
+                };
+                let events = vec![
+                    virtio_input_event::absolute_x(button_event.x.max(0)),
+                    virtio_input_event::absolute_y(button_event.y.max(0)),
+                    button,
+                ];
+                return Some(GpuDisplayEvents {
+                    events,
+                    device_type: EventDeviceKind::Touchscreen,
+                });
             }
             XEventEnum::Motion(motion) => {
-                if motion.state & xlib::Button1Mask != 0 {
-                    let events = vec![
-                        virtio_input_event::multitouch_slot(0),
-                        virtio_input_event::multitouch_tracking_id(self.current_tracking_id()),
-                        virtio_input_event::multitouch_absolute_x(max(0, motion.x)),
-                        virtio_input_event::multitouch_absolute_y(max(0, motion.y)),
-                    ];
-
-                    return Some(GpuDisplayEvents {
-                        events,
-                        device_type: EventDeviceKind::Touchscreen,
-                    });
-                }
+                let events = vec![
+                    virtio_input_event::absolute_x(motion.x.max(0)),
+                    virtio_input_event::absolute_y(motion.y.max(0)),
+                ];
+                return Some(GpuDisplayEvents {
+                    events,
+                    device_type: EventDeviceKind::Touchscreen,
+                });
             }
             XEventEnum::Expose => surface.draw_current_buffer(),
             XEventEnum::ClientMessage(xclient_data) => {
