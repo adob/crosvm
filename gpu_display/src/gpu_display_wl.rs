@@ -332,6 +332,15 @@ impl DisplayT for DisplayWl {
                     device_type: EventDeviceKind::Touchscreen,
                 })
             }
+            DWL_EVENT_TYPE_POINTER_WHEEL => {
+                // Wayland uses positive values for scrolling down. Linux REL_WHEEL uses positive
+                // values for scrolling up, so reverse the sign when crossing into virtio-input.
+                let events = vec![virtio_input_event::wheel(event.params[0].saturating_neg())];
+                Some(GpuDisplayEvents {
+                    events,
+                    device_type: EventDeviceKind::Touchscreen,
+                })
+            }
             // --display-window-mouse is backed by an absolute mouse device. Native Wayland touch
             // events are not forwarded through that device.
             DWL_EVENT_TYPE_TOUCH_DOWN | DWL_EVENT_TYPE_TOUCH_MOTION | DWL_EVENT_TYPE_TOUCH_UP => {

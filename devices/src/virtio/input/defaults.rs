@@ -14,9 +14,9 @@ use super::VirtioInputConfig;
 
 /// Instantiates a VirtioInputConfig for an absolute mouse/tablet-style pointer.
 ///
-/// This deliberately advertises ABS_X/ABS_Y plus normal mouse buttons, without
-/// touchpad or touchscreen properties. Linux userspace classifies this shape as
-/// an absolute mouse (the same model used by integrated VM pointing devices).
+/// This deliberately advertises ABS_X/ABS_Y, normal mouse buttons, and a relative wheel, without
+/// touchpad or touchscreen properties. Linux userspace classifies this shape as an absolute mouse
+/// (the same model used by integrated VM pointing devices).
 pub fn new_absolute_pointer_config(
     idx: u32,
     width: u32,
@@ -339,6 +339,7 @@ fn default_absolute_pointer_events() -> BTreeMap<u16, virtio_input_bitmap> {
         virtio_input_bitmap::from_bits(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE]),
     );
     supported_events.insert(EV_ABS, virtio_input_bitmap::from_bits(&[ABS_X, ABS_Y]));
+    supported_events.insert(EV_REL, virtio_input_bitmap::from_bits(&[REL_WHEEL]));
     supported_events
 }
 
@@ -533,6 +534,10 @@ mod tests {
         assert_eq!(
             config.supported_events[&EV_ABS],
             virtio_input_bitmap::from_bits(&[ABS_X, ABS_Y])
+        );
+        assert_eq!(
+            config.supported_events[&EV_REL],
+            virtio_input_bitmap::from_bits(&[REL_WHEEL])
         );
         assert_eq!(
             config.axis_info[&ABS_X],

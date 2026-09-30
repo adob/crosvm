@@ -76,6 +76,7 @@ pub const DWL_EVENT_TYPE_POINTER_LEAVE: u32 = 0x11;
 pub const DWL_EVENT_TYPE_POINTER_MOVE: u32 = 0x12;
 #[allow(dead_code)]
 pub const DWL_EVENT_TYPE_POINTER_BUTTON: u32 = 0x13;
+pub const DWL_EVENT_TYPE_POINTER_WHEEL: u32 = 0x14;
 pub const DWL_EVENT_TYPE_TOUCH_DOWN: u32 = 0x20;
 pub const DWL_EVENT_TYPE_TOUCH_UP: u32 = 0x21;
 pub const DWL_EVENT_TYPE_TOUCH_MOTION: u32 = 0x22;

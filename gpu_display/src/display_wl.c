@@ -48,6 +48,7 @@ const uint32_t DWL_EVENT_TYPE_POINTER_ENTER  = 0x10;
 const uint32_t DWL_EVENT_TYPE_POINTER_LEAVE  = 0x11;
 const uint32_t DWL_EVENT_TYPE_POINTER_MOVE   = 0x12;
 const uint32_t DWL_EVENT_TYPE_POINTER_BUTTON = 0x13;
+const uint32_t DWL_EVENT_TYPE_POINTER_WHEEL  = 0x14;
 const uint32_t DWL_EVENT_TYPE_TOUCH_DOWN     = 0x20;
 const uint32_t DWL_EVENT_TYPE_TOUCH_UP       = 0x21;
 const uint32_t DWL_EVENT_TYPE_TOUCH_MOTION   = 0x22;
@@ -477,10 +478,18 @@ static void wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
 static void wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
 				     uint32_t axis, int32_t discrete)
 {
-	(void)data;
+	struct dwl_context *context = (struct dwl_context*)data;
+	struct input *input = &context->input;
 	(void)wl_pointer;
-	(void)axis;
-	(void)discrete;
+
+	if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL || discrete == 0)
+		return;
+
+	struct dwl_event event = {0};
+	event.surface_descriptor = input->pointer_input_surface;
+	event.event_type = DWL_EVENT_TYPE_POINTER_WHEEL;
+	event.params[0] = discrete;
+	dwl_context_push_event(context, &event);
 }
 
 const struct wl_pointer_listener wl_pointer_listener = {
