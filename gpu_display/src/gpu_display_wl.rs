@@ -294,6 +294,26 @@ impl DisplayT for DisplayWl {
         Ok(descriptor)
     }
 
+    fn handle_next_event_without_surface(&mut self) -> Option<GpuDisplayEvents> {
+        let event = self.current_event.as_ref()?;
+        let device_type = match (event.event_type, event.params[1]) {
+            (DWL_EVENT_TYPE_KEYBOARD_KEY, DWL_KEYBOARD_KEY_STATE_RELEASED) => {
+                EventDeviceKind::Keyboard
+            }
+            (DWL_EVENT_TYPE_POINTER_BUTTON, 0) => EventDeviceKind::Touchscreen,
+            _ => return None,
+        };
+        let event = self.current_event.take().unwrap();
+        Some(GpuDisplayEvents {
+            events: vec![virtio_input_event::key(
+                event.params[0] as u16,
+                false,
+                false,
+            )],
+            device_type,
+        })
+    }
+
     fn handle_next_event(
         &mut self,
         _surface: &mut Box<dyn GpuDisplaySurface>,
@@ -483,5 +503,183 @@ impl AsRawDescriptor for DisplayWl {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         // Safe given that the context pointer is valid.
         self.ctx.as_raw_descriptor()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use base::BlockingMode;
+    use base::Event;
+    use base::FramingMode;
+    use base::StreamChannel;
+    use base::WaitContext;
+
+    use super::*;
+    use crate::EventDevice;
+    use crate::GpuDisplay;
+
+    fn event(event_type: u32, code: i32, state: i32) -> dwl_event {
+        dwl_event {
+            // Identity only; never dereferenced. No live surface has this descriptor.
+            surface_descriptor: 1234usize as *const std::ffi::c_void,
+            event_type,
+            params: [code, state, 0],
+        }
+    }
+
+    fn disconnected_display() -> DisplayWl {
+        // SAFETY: creates an owned context with no compositor connection. The
+        // destructor checks for a connection before disconnecting it.
+        let ctx = DwlContext(unsafe { dwl_context_new(None) });
+        assert!(!ctx.0.is_null());
+        DisplayWl {
+            dmabufs: HashMap::new(),
+            ctx,
+            current_event: None,
+        }
+    }
+
+    #[test]
+    fn releases_do_not_require_a_live_surface() {
+        let mut display = disconnected_display();
+        for (kind, code, device_type) in [
+            (DWL_EVENT_TYPE_KEYBOARD_KEY, 56, EventDeviceKind::Keyboard),
+            (
+                DWL_EVENT_TYPE_POINTER_BUTTON,
+                0x113,
+                EventDeviceKind::Touchscreen,
+            ),
+        ] {
+            display.current_event = Some(event(kind, code, 0));
+            let report = display.handle_next_event_without_surface().unwrap();
+            assert_eq!(report.device_type, device_type);
+            assert_eq!(
+                report.events,
+                vec![virtio_input_event::key(code as u16, false, false)]
+            );
+            assert!(display.current_event.is_none());
+        }
+    }
+
+    #[test]
+    fn presses_and_motion_still_require_a_live_surface() {
+        let mut display = disconnected_display();
+        for (kind, code, value) in [
+            (DWL_EVENT_TYPE_KEYBOARD_KEY, 56, 1),
+            (DWL_EVENT_TYPE_POINTER_BUTTON, 0x113, 1),
+            (DWL_EVENT_TYPE_POINTER_MOVE, 100, 200),
+            (DWL_EVENT_TYPE_POINTER_WHEEL, 1, 0),
+        ] {
+            display.current_event = Some(event(kind, code, value));
+            assert!(display.handle_next_event_without_surface().is_none());
+            assert!(display.current_event.is_some());
+        }
+    }
+
+    // Drive the common dispatcher with real Wayland translation and event
+    // sockets, but no display server, GPU, or VM.
+    struct TestDisplay {
+        display: DisplayWl,
+        events: VecDeque<dwl_event>,
+        wake: Event,
+    }
+
+    impl AsRawDescriptor for TestDisplay {
+        fn as_raw_descriptor(&self) -> RawDescriptor {
+            self.wake.as_raw_descriptor()
+        }
+    }
+
+    impl SysDisplayT for TestDisplay {}
+
+    impl DisplayT for TestDisplay {
+        fn pending_events(&self) -> bool {
+            !self.events.is_empty()
+        }
+
+        fn next_event(&mut self) -> GpuDisplayResult<u64> {
+            let event = self.events.pop_front().unwrap();
+            self.display.current_event = Some(event);
+            Ok(event.surface_descriptor as u64)
+        }
+
+        fn handle_next_event_without_surface(&mut self) -> Option<GpuDisplayEvents> {
+            self.display.handle_next_event_without_surface()
+        }
+
+        fn handle_next_event(
+            &mut self,
+            surface: &mut Box<dyn GpuDisplaySurface>,
+        ) -> Option<GpuDisplayEvents> {
+            self.display.handle_next_event(surface)
+        }
+
+        fn create_surface(
+            &mut self,
+            _parent: Option<u32>,
+            _id: u32,
+            _scanout: Option<u32>,
+            _params: &DisplayParameters,
+            _kind: SurfaceType,
+        ) -> GpuDisplayResult<Box<dyn GpuDisplaySurface>> {
+            Err(GpuDisplayError::Unsupported)
+        }
+
+        fn release_surface(&mut self, _id: u32) {
+            self.events
+                .push_back(event(DWL_EVENT_TYPE_KEYBOARD_KEY, 56, 0));
+            self.events
+                .push_back(event(DWL_EVENT_TYPE_POINTER_BUTTON, 0x113, 0));
+        }
+    }
+
+    #[test]
+    fn destroying_surface_dispatches_releases_without_waiting_for_compositor() {
+        let (keyboard_tx, keyboard_rx) =
+            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte).unwrap();
+        let (pointer_tx, pointer_rx) =
+            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte).unwrap();
+        let keyboard = EventDevice::keyboard(keyboard_rx);
+        let pointer = EventDevice::touchscreen(pointer_rx);
+        let backend = TestDisplay {
+            display: disconnected_display(),
+            // Stale presses must not reach the guest after their surface is gone.
+            events: VecDeque::from([
+                event(DWL_EVENT_TYPE_KEYBOARD_KEY, 56, 1),
+                event(DWL_EVENT_TYPE_POINTER_BUTTON, 0x113, 1),
+            ]),
+            wake: Event::new().unwrap(),
+        };
+        let mut display = GpuDisplay {
+            inner: Box::new(backend),
+            event_devices: std::collections::BTreeMap::from([
+                (1, EventDevice::keyboard(keyboard_tx)),
+                (2, EventDevice::touchscreen(pointer_tx)),
+            ]),
+            surfaces: Default::default(),
+            next_id: 3,
+            wait_ctx: WaitContext::new().unwrap(),
+        };
+        display.release_surface(1);
+        assert_eq!(
+            keyboard.recv_event_encoded().unwrap(),
+            virtio_input_event::key(56, false, false)
+        );
+        assert_eq!(
+            keyboard.recv_event_encoded().unwrap(),
+            virtio_input_event::syn()
+        );
+        assert_eq!(
+            pointer.recv_event_encoded().unwrap(),
+            virtio_input_event::key(0x113, false, false)
+        );
+        assert_eq!(
+            pointer.recv_event_encoded().unwrap(),
+            virtio_input_event::syn()
+        );
+        assert!(keyboard.recv_event_encoded().is_err());
+        assert!(pointer.recv_event_encoded().is_err());
     }
 }

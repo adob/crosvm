@@ -308,6 +308,13 @@ trait DisplayT: AsRawDescriptor {
         Ok(0)
     }
 
+    /// Handles events that must survive the removal of their source surface,
+    /// such as key/button releases. Backends must leave other events pending
+    /// for `handle_next_event`.
+    fn handle_next_event_without_surface(&mut self) -> Option<GpuDisplayEvents> {
+        None
+    }
+
     /// Handles the event from the compositor, and returns an list of events
     fn handle_next_event(
         &mut self,
@@ -503,21 +510,28 @@ impl GpuDisplay {
 
     fn dispatch_display_events(&mut self) -> GpuDisplayResult<()> {
         self.inner.flush();
+        self.dispatch_pending_display_events()
+    }
+
+    fn dispatch_pending_display_events(&mut self) -> GpuDisplayResult<()> {
         while self.inner.pending_events() {
             let surface_descriptor = self.inner.next_event()?;
 
-            for surface in self.surfaces.values_mut() {
-                if surface_descriptor != surface.surface_descriptor() {
-                    continue;
-                }
-
-                if let Some(gpu_display_events) = self.inner.handle_next_event(surface) {
-                    for event_device in self.event_devices.values_mut() {
-                        if event_device.kind() != gpu_display_events.device_type {
-                            continue;
-                        }
-
-                        event_device.send_report(gpu_display_events.events.iter().cloned())?;
+            // Releases must reach the guest even if a resize has destroyed the
+            // surface that originally received the press. Other events still
+            // require a live surface and retain the existing routing behavior.
+            let events = match self.inner.handle_next_event_without_surface() {
+                Some(events) => Some(events),
+                None => self
+                    .surfaces
+                    .values_mut()
+                    .find(|surface| surface_descriptor == surface.surface_descriptor())
+                    .and_then(|surface| self.inner.handle_next_event(surface)),
+            };
+            if let Some(events) = events {
+                for event_device in self.event_devices.values_mut() {
+                    if event_device.kind() == events.device_type {
+                        event_device.send_report(events.events.iter().cloned())?;
                     }
                 }
             }
@@ -600,6 +614,15 @@ impl GpuDisplay {
     pub fn release_surface(&mut self, surface_id: u32) {
         self.surfaces.remove(&surface_id);
         self.inner.release_surface(surface_id);
+        // Surface destruction can enqueue releases locally, with no subsequent
+        // compositor event to wake the display loop. Drain without a blocking
+        // read from the Wayland socket.
+        if let Err(e) = self.dispatch_pending_display_events() {
+            base::error!(
+                "failed to dispatch input releases after destroying a surface: {}",
+                e
+            );
+        }
     }
 
     /// Gets a reference to an unused framebuffer for the identified surface.

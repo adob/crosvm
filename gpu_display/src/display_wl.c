@@ -38,9 +38,22 @@
 #define BTN_FORWARD 0x115
 #define BTN_BACK 0x116
 
+static const uint32_t POINTER_BUTTONS[] = {
+	BTN_LEFT,
+	BTN_RIGHT,
+	BTN_MIDDLE,
+	BTN_SIDE,
+	BTN_EXTRA,
+	BTN_FORWARD,
+	BTN_BACK,
+};
+
 #define DEFAULT_SCALE 2
 #define MAX_BUFFER_COUNT 64
 #define EVENT_BUF_SIZE 256
+// Linux KEY_CNT, including extended keys, without requiring kernel headers.
+#define KEY_STATE_COUNT 0x300
+#define POINTER_BUTTON_COUNT (sizeof(POINTER_BUTTONS) / sizeof(POINTER_BUTTONS[0]))
 
 const int32_t DWL_KEYBOARD_KEY_STATE_RELEASED = WL_KEYBOARD_KEY_STATE_RELEASED;
 const int32_t DWL_KEYBOARD_KEY_STATE_PRESSED  = WL_KEYBOARD_KEY_STATE_PRESSED;
@@ -64,6 +77,13 @@ struct dwl_event {
 	const void *surface_descriptor;
 	uint32_t event_type;
 	int32_t params[3];
+};
+
+// A fixed slot per key/button preserves its latest state if the event FIFO
+// fills. No allocation is needed to retain a release, even during focus loss.
+struct pending_input_event {
+	bool pending;
+	struct dwl_event event;
 };
 
 struct dwl_context;
@@ -96,8 +116,10 @@ struct input {
 	struct wl_pointer *wl_pointer;
 	struct wl_surface *keyboard_input_surface;
 	struct wl_surface *pointer_input_surface;
+	bool keyboard_keys[KEY_STATE_COUNT];
 	int32_t pointer_x;
 	int32_t pointer_y;
+	uint32_t pointer_buttons;
 };
 
 typedef void (*dwl_error_callback_type)(const char *message);
@@ -114,6 +136,12 @@ struct dwl_context {
 	struct dwl_event event_cbuf[EVENT_BUF_SIZE];
 	size_t event_read_pos;
 	size_t event_write_pos;
+	size_t event_count;
+	struct pending_input_event deferred_keys[KEY_STATE_COUNT];
+	struct pending_input_event deferred_buttons[POINTER_BUTTON_COUNT];
+	struct pending_input_event deferred_motion;
+	size_t deferred_event_count;
+	bool overflow_logged;
 
 	dwl_error_callback_type error_callback;
 };
@@ -266,17 +294,96 @@ static void wl_keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
 	}
 }
 
+static size_t pointer_button_index(uint32_t button)
+{
+	for (size_t i = 0; i < POINTER_BUTTON_COUNT; i++) {
+		if (POINTER_BUTTONS[i] == button)
+			return i;
+	}
+	return POINTER_BUTTON_COUNT;
+}
+
+static void dwl_context_defer_event(struct dwl_context *self,
+				    const struct dwl_event *event)
+{
+	struct pending_input_event *pending = NULL;
+	if (event->event_type == DWL_EVENT_TYPE_KEYBOARD_KEY) {
+		uint32_t key = (uint32_t)event->params[0];
+		if (key < KEY_STATE_COUNT)
+			pending = &self->deferred_keys[key];
+	} else if (event->event_type == DWL_EVENT_TYPE_POINTER_BUTTON) {
+		size_t index = pointer_button_index((uint32_t)event->params[0]);
+		if (index < POINTER_BUTTON_COUNT)
+			pending = &self->deferred_buttons[index];
+	} else if (event->event_type == DWL_EVENT_TYPE_POINTER_MOVE) {
+		pending = &self->deferred_motion;
+	}
+
+	// Wheel/touch events may be lost under overload, but every supported key
+	// and button has a dedicated slot. Intermediate transitions can coalesce;
+	// the final pressed/released state must not be lost.
+	if (!pending)
+		return;
+	if (!pending->pending)
+		self->deferred_event_count++;
+	pending->pending = true;
+	pending->event = *event;
+}
+
 static void dwl_context_push_event(struct dwl_context *self,
 				   struct dwl_event *event)
 {
 	if (!self)
 		return;
 
+	// Coalesce adjacent motion, but never let new events overtake the overflow
+	// state waiting behind this FIFO.
+	if (!self->deferred_event_count &&
+	    event->event_type == DWL_EVENT_TYPE_POINTER_MOVE && self->event_count > 0) {
+		size_t previous = self->event_write_pos == 0 ?
+			EVENT_BUF_SIZE - 1 : self->event_write_pos - 1;
+		struct dwl_event *previous_event = self->event_cbuf + previous;
+		if (previous_event->event_type == DWL_EVENT_TYPE_POINTER_MOVE &&
+		    previous_event->surface_descriptor == event->surface_descriptor) {
+			memcpy(previous_event, event, sizeof(struct dwl_event));
+			return;
+		}
+	}
+
+	if (self->event_count == EVENT_BUF_SIZE || self->deferred_event_count) {
+		if (!self->overflow_logged) {
+			self->error_callback("Wayland input event buffer overflow; coalescing input state");
+			self->overflow_logged = true;
+		}
+		dwl_context_defer_event(self, event);
+		return;
+	}
+
 	memcpy(self->event_cbuf + self->event_write_pos, event,
 	       sizeof(struct dwl_event));
 
 	if (++self->event_write_pos == EVENT_BUF_SIZE)
 		self->event_write_pos = 0;
+	self->event_count++;
+}
+
+static void release_keyboard_keys(struct dwl_context *context)
+{
+	struct input *input = &context->input;
+	for (uint32_t key = 0; key < KEY_STATE_COUNT; key++) {
+		if (!input->keyboard_keys[key])
+			continue;
+
+		struct dwl_event event = {0};
+		event.surface_descriptor = input->keyboard_input_surface;
+		event.event_type = DWL_EVENT_TYPE_KEYBOARD_KEY;
+		event.params[0] = (int32_t)key;
+		event.params[1] = DWL_KEYBOARD_KEY_STATE_RELEASED;
+		// Valid key transitions are always retained, either in the FIFO or in
+		// their reserved overflow slot, before we clear the tracked state.
+		dwl_context_push_event(context, &event);
+		input->keyboard_keys[key] = false;
+	}
 }
 
 static void wl_keyboard_enter(void *data, struct wl_keyboard *wl_keyboard,
@@ -290,8 +397,14 @@ static void wl_keyboard_enter(void *data, struct wl_keyboard *wl_keyboard,
 	struct input *input = &context->input;
 	uint32_t *key;
 	struct dwl_event event = {0};
+	// Reconcile the new focus snapshot rather than retaining stale keys from
+	// an old surface. Reconstruct held keys for the guest's virtual keyboard.
+	release_keyboard_keys(context);
 	input->keyboard_input_surface = surface;
 	wl_array_for_each(key, keys) {
+		if (*key >= KEY_STATE_COUNT)
+			continue;
+		input->keyboard_keys[*key] = true;
 		event.surface_descriptor = input->keyboard_input_surface;
 		event.event_type = DWL_EVENT_TYPE_KEYBOARD_KEY;
 		event.params[0] = (int32_t)*key;
@@ -309,6 +422,9 @@ static void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
 	(void)wl_keyboard;
 	(void)serial;
 	(void)time;
+	if (!input->keyboard_input_surface || key >= KEY_STATE_COUNT)
+		return;
+	input->keyboard_keys[key] = state == WL_KEYBOARD_KEY_STATE_PRESSED;
 	struct dwl_event event = {0};
 	event.surface_descriptor = input->keyboard_input_surface;
 	event.event_type = DWL_EVENT_TYPE_KEYBOARD_KEY;
@@ -322,15 +438,11 @@ static void wl_keyboard_leave(void *data, struct wl_keyboard *wl_keyboard,
 {
 	struct dwl_context *context = (struct dwl_context*)data;
 	struct input *input = &context->input;
-	struct dwl_event event = {0};
 	(void)wl_keyboard;
 	(void)serial;
 	(void)surface;
 
-	event.surface_descriptor = input->keyboard_input_surface;
-	event.event_type = DWL_EVENT_TYPE_KEYBOARD_LEAVE;
-	dwl_context_push_event(context, &event);
-
+	release_keyboard_keys(context);
 	input->keyboard_input_surface = NULL;
 }
 
@@ -394,7 +506,24 @@ static void pointer_leave_handler(void *data, struct wl_pointer *wl_pointer,
 	struct input *input = &context->input;
 	(void)wl_pointer;
 	(void)serial;
-	(void)surface;
+
+	// Do not allow a lost pointer focus to leave a mouse button latched in the
+	// guest. This is normally redundant because Wayland keeps an implicit grab
+	// until all buttons are released, but it also makes focus loss resilient to
+	// backend/window-system edge cases.
+	for (size_t i = 0; i < POINTER_BUTTON_COUNT; i++) {
+		uint32_t button_bit = 1u << i;
+		if (!(input->pointer_buttons & button_bit))
+			continue;
+
+		struct dwl_event event = {0};
+		event.surface_descriptor = surface;
+		event.event_type = DWL_EVENT_TYPE_POINTER_BUTTON;
+		event.params[0] = POINTER_BUTTONS[i];
+		event.params[1] = WL_POINTER_BUTTON_STATE_RELEASED;
+		dwl_context_push_event(context, &event);
+	}
+	input->pointer_buttons = 0;
 
 	input->pointer_input_surface = NULL;
 }
@@ -427,10 +556,15 @@ static void pointer_button_handler(void *data, struct wl_pointer *wl_pointer,
 	(void)time;
 	(void)serial;
 
-	if (button != BTN_LEFT && button != BTN_RIGHT && button != BTN_MIDDLE &&
-	    button != BTN_SIDE && button != BTN_EXTRA && button != BTN_FORWARD &&
-	    button != BTN_BACK)
+	size_t button_index = pointer_button_index(button);
+	if (!input->pointer_input_surface || button_index == POINTER_BUTTON_COUNT)
 		return;
+
+	uint32_t button_bit = 1u << button_index;
+	if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+		input->pointer_buttons |= button_bit;
+	else
+		input->pointer_buttons &= ~button_bit;
 
 	// Synchronize the absolute position before reporting the button event.
 	struct dwl_event motion_event = {0};
@@ -522,6 +656,7 @@ static void wl_seat_capabilities(void *data, struct wl_seat *wl_seat,
 		input->wl_keyboard = wl_seat_get_keyboard(wl_seat);
 		wl_keyboard_add_listener(input->wl_keyboard, &wl_keyboard_listener, context);
 	} else if (!have_keyboard && input->wl_keyboard != NULL) {
+		wl_keyboard_leave(context, NULL, 0, input->keyboard_input_surface);
 		wl_keyboard_release(input->wl_keyboard);
 		input->wl_keyboard = NULL;
 	}
@@ -530,6 +665,7 @@ static void wl_seat_capabilities(void *data, struct wl_seat *wl_seat,
 		input->wl_pointer = wl_seat_get_pointer(wl_seat);
 		wl_pointer_add_listener(input->wl_pointer, &wl_pointer_listener, context);
 	} else if (!have_pointer && input->wl_pointer != NULL) {
+		pointer_leave_handler(context, NULL, 0, input->pointer_input_surface);
 		wl_pointer_release(input->wl_pointer);
 		input->wl_pointer = NULL;
 	}
@@ -1233,10 +1369,24 @@ fail:
 	return NULL;
 }
 
+static void release_surface_input(struct dwl_context *context, struct wl_surface *surface)
+{
+	if (!surface)
+		return;
+	if (context->input.keyboard_input_surface == surface)
+		wl_keyboard_leave(context, NULL, 0, surface);
+	if (context->input.pointer_input_surface == surface)
+		pointer_leave_handler(context, NULL, 0, surface);
+}
+
 void dwl_surface_destroy(struct dwl_surface **self)
 {
 	size_t i;
 
+	// A destroyed surface need not receive a final leave event. Queue releases
+	// while its input state is still available; Rust dispatches releases even
+	// after the surface has been removed from its surface map.
+	release_surface_input((*self)->context, (*self)->wl_surface);
 	dwl_context_remove_surface((*self)->context, (*self)->surface_id);
 	if ((*self)->virtio_gpu_surface_metadata)
 		wp_virtio_gpu_surface_metadata_v1_destroy(
@@ -1325,19 +1475,39 @@ const void* dwl_surface_descriptor(const struct dwl_surface *self)
 
 bool dwl_context_pending_events(const struct dwl_context *self)
 {
-	if (self->event_write_pos == self->event_read_pos)
-		return false;
-
-	return true;
+	return self->event_count > 0 || self->deferred_event_count > 0;
 }
 
 void dwl_context_next_event(struct dwl_context *self, struct dwl_event *event)
 {
-	memcpy(event, self->event_cbuf + self->event_read_pos,
-	       sizeof(struct dwl_event));
-
-	if (++self->event_read_pos == EVENT_BUF_SIZE)
-		self->event_read_pos = 0;
+	assert(dwl_context_pending_events(self));
+	if (self->event_count) {
+		*event = self->event_cbuf[self->event_read_pos];
+		if (++self->event_read_pos == EVENT_BUF_SIZE)
+			self->event_read_pos = 0;
+		self->event_count--;
+	} else {
+		struct pending_input_event *pending = NULL;
+		for (size_t i = 0; i < KEY_STATE_COUNT; i++) {
+			if (self->deferred_keys[i].pending) {
+				pending = &self->deferred_keys[i];
+				break;
+			}
+		}
+		// Synchronize position before any deferred mouse-button events.
+		if (!pending && self->deferred_motion.pending)
+			pending = &self->deferred_motion;
+		for (size_t i = 0; !pending && i < POINTER_BUTTON_COUNT; i++) {
+			if (self->deferred_buttons[i].pending)
+				pending = &self->deferred_buttons[i];
+		}
+		assert(pending);
+		*event = pending->event;
+		pending->pending = false;
+		self->deferred_event_count--;
+	}
+	if (!dwl_context_pending_events(self))
+		self->overflow_logged = false;
 }
 
 void dwl_surface_set_scanout_id(struct dwl_surface *self, uint32_t scanout_id)
