@@ -336,7 +336,15 @@ fn default_absolute_pointer_events() -> BTreeMap<u16, virtio_input_bitmap> {
     let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
     supported_events.insert(
         EV_KEY,
-        virtio_input_bitmap::from_bits(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE]),
+        virtio_input_bitmap::from_bits(&[
+            BTN_LEFT,
+            BTN_RIGHT,
+            BTN_MIDDLE,
+            BTN_SIDE,
+            BTN_EXTRA,
+            BTN_FORWARD,
+            BTN_BACK,
+        ]),
     );
     supported_events.insert(EV_ABS, virtio_input_bitmap::from_bits(&[ABS_X, ABS_Y]));
     supported_events.insert(EV_REL, virtio_input_bitmap::from_bits(&[REL_WHEEL]));
@@ -529,7 +537,15 @@ mod tests {
         assert_eq!(config.properties, virtio_input_bitmap::new([0u8; 128]));
         assert_eq!(
             config.supported_events[&EV_KEY],
-            virtio_input_bitmap::from_bits(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE])
+            virtio_input_bitmap::from_bits(&[
+                BTN_LEFT,
+                BTN_RIGHT,
+                BTN_MIDDLE,
+                BTN_SIDE,
+                BTN_EXTRA,
+                BTN_FORWARD,
+                BTN_BACK,
+            ])
         );
         assert_eq!(
             config.supported_events[&EV_ABS],

@@ -33,6 +33,10 @@
 #define BTN_LEFT 0x110
 #define BTN_RIGHT 0x111
 #define BTN_MIDDLE 0x112
+#define BTN_SIDE 0x113
+#define BTN_EXTRA 0x114
+#define BTN_FORWARD 0x115
+#define BTN_BACK 0x116
 
 #define DEFAULT_SCALE 2
 #define MAX_BUFFER_COUNT 64
@@ -423,7 +427,9 @@ static void pointer_button_handler(void *data, struct wl_pointer *wl_pointer,
 	(void)time;
 	(void)serial;
 
-	if (button != BTN_LEFT && button != BTN_RIGHT && button != BTN_MIDDLE)
+	if (button != BTN_LEFT && button != BTN_RIGHT && button != BTN_MIDDLE &&
+	    button != BTN_SIDE && button != BTN_EXTRA && button != BTN_FORWARD &&
+	    button != BTN_BACK)
 		return;
 
 	// Synchronize the absolute position before reporting the button event.
